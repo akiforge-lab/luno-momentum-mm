@@ -201,7 +201,14 @@ class MomentumMarketMaker:
 
         # Fetch initial market info and fees
         await self._refresh_market_info()
+
+        # Validate pairs against live Luno markets — drop unsupported/inactive
+        await self._validate_active_pairs()
+
         await self._refresh_fees()
+
+        # Cancel any pre-existing exchange orders before placing new quotes
+        await self._cancel_startup_orders()
 
         # Sync real balances before first quote tick
         await self._sync_balances()
@@ -524,6 +531,67 @@ class MomentumMarketMaker:
                 self._risk.sync_inventory(pair, bal)
         except Exception as exc:
             log.warning('"balance sync error"', extra={"error": str(exc)})
+
+    async def _validate_active_pairs(self) -> None:
+        """
+        Remove from self._pairs any pair whose market info is missing or
+        whose trading_status is not ACTIVE. Runs once at startup after
+        _refresh_market_info().
+        """
+        valid = []
+        for pair in list(self._pairs):
+            info = self._market_info.get(pair)
+            if info is None:
+                log.warning('"pair not found on Luno, skipping"', extra={"pair": pair})
+                continue
+            if info.status != "ACTIVE":
+                log.warning(
+                    '"pair not ACTIVE, skipping"',
+                    extra={"pair": pair, "status": info.status},
+                )
+                continue
+            valid.append(pair)
+        removed = set(self._pairs) - set(valid)
+        if removed:
+            log.info('"pairs removed after validation"', extra={"removed": list(removed)})
+        self._pairs = valid
+        # Re-align dependent structures
+        for pair in removed:
+            self._ws.pop(pair, None)
+
+    async def _cancel_startup_orders(self) -> None:
+        """
+        Cancel all open exchange orders for enabled pairs before placing any
+        new quotes. Handles stale orders from prior sessions. Dry-run logs
+        without cancelling.
+        """
+        if self._dry_run:
+            log.info('"[DRY-RUN] startup order cleanup — would cancel all open orders"',
+                     extra={"pairs": self._pairs})
+            return
+        total = 0
+        for pair in self._pairs:
+            try:
+                orders = await self._client.get_open_orders(pair)
+                for order in orders:
+                    ok = await self._client.cancel_order(order.order_id)
+                    log.info(
+                        '"startup cancel"',
+                        extra={
+                            "pair": pair,
+                            "order_id": order.order_id,
+                            "side": order.side,
+                            "price": str(order.price),
+                            "size": str(order.volume),
+                            "success": ok,
+                        },
+                    )
+                    total += 1
+            except Exception as exc:
+                log.warning(
+                    '"startup cancel error"', extra={"pair": pair, "error": str(exc)}
+                )
+        log.info('"startup order cleanup complete"', extra={"cancelled": total})
 
     def _save_state(self) -> None:
         risk_state = self._risk.to_state_dict()

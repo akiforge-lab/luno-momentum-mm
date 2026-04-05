@@ -142,7 +142,14 @@ class LunoClient:
                 async with session.request(
                     method, url, params=params, data=data
                 ) as resp:
-                    body = await resp.json(content_type=None)
+                    raw = await resp.read()
+                    body = {}
+                    if raw:
+                        import json as _json
+                        try:
+                            body = _json.loads(raw)
+                        except ValueError:
+                            body = {}
                     if resp.status == 429:
                         retry_after = float(resp.headers.get("Retry-After", 2.0))
                         log.warning(
