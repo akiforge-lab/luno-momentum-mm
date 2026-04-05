@@ -1,0 +1,180 @@
+# ============================================================
+# Luno Momentum Market-Maker — configuration
+# ============================================================
+
+# ── Core loop timing ────────────────────────────────────────
+quote_interval_sec: 2.0          # How often to reprice/sync orders
+signal_refresh_interval_sec: 300 # How often to re-run momentum classification
+state_save_interval_sec: 15      # How often to persist state to disk
+order_reconcile_interval_sec: 30 # How often to reconcile local orders with REST
+market_info_refresh_interval_sec: 3600
+fee_refresh_interval_sec: 3600
+
+# ── Dashboard ────────────────────────────────────────────────
+dashboard:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8088
+
+# ── Momentum signal classifier ───────────────────────────────
+# Algorithm mirrors the Hyperliquid scanner (compute_momentum.py):
+#   slope_ann_pct = daily_OLS_slope(log_close) × 252 × 100
+#   r2            = R² of that regression
+#   momentum_score = slope_ann_pct × r2
+#   ma100         = 100-day SMA of close
+#   LONG   if slope_ann_pct > 0 AND r2 ≥ min_r2 AND close > ma100
+#   SHORT  if slope_ann_pct < 0 AND r2 ≥ min_r2 AND close < ma100
+#   NEUTRAL otherwise
+# Data source: Luno daily candles (MYR-denominated) for each enabled pair.
+signal:
+  # Minimum R² for a directional signal to be considered actionable
+  min_r2: 0.50
+  # Regression lookback window (days) — same as HL scanner default
+  regression_window: 90
+  # Minimum closes required; fewer → NEUTRAL
+  min_closes: 100
+  # SMA window for trend-direction confirmation
+  ma_window: 100
+  # How many days of history to fetch from Luno
+  lookback_days: 220
+  # How long to reuse cached candles before re-fetching (hours)
+  candle_cache_ttl_hours: 12
+  # Where to cache daily closes
+  cache_dir: "data/candles"
+  # Signal to use when classification cannot be completed
+  fallback_direction: "NEUTRAL"
+
+# ── Global risk limits ───────────────────────────────────────
+risk:
+  # Set to true to cancel all orders and halt quoting immediately
+  global_kill_switch: false
+  # Stop quoting (but don't cancel) once daily realized loss exceeds this (MYR)
+  max_daily_loss_myr: 500.0
+  # Hard cap on total open orders across all pairs
+  max_open_orders_total: 20
+  # If the best WS orderbook update is older than this, treat data as stale
+  stale_orderbook_threshold_sec: 30
+  # Allow taker orders only for emergency inventory reduction (size > max_inventory)
+  emergency_inventory_reduction: true
+  # Gracefully cancel open orders on shutdown
+  cancel_on_shutdown: true
+
+# ── Per-pair configuration ───────────────────────────────────
+# hl_symbol: the symbol used in Hyperliquid scanner (for signal lookup)
+# All spread values in basis points (1 bps = 0.01 %)
+pairs:
+  XBTMYR:
+    enabled: true
+    hl_symbol: BTC
+    # Spread / quoting geometry
+    base_spread_bps: 20.0          # Half-spread on each side
+    min_spread_bps: 8.0            # Safety floor (below = unprofitable vs maker fee)
+    momentum_long_skew_bps: 8.0   # Shift reservation price UP when LONG signal
+    momentum_short_skew_bps: 8.0  # Shift reservation price DOWN when SHORT signal
+    inventory_skew_factor: 1.5    # Amplify inventory mean-reversion
+    cancel_replace_threshold_bps: 5.0   # Reprice if order drifts this far
+    # Order sizing
+    quote_size_base: "0.0001"     # Minimum practical size for cautious first live run
+    max_inventory_base: "0.005"   # Legacy static floor (used when allocation_pct=0)
+    max_notional_myr: 10000.0     # Hard ceiling on total MYR exposure per pair
+    # Portfolio-based dynamic limit: max_inv = min(portfolio × allocation_pct / mid, hard_cap)
+    allocation_pct: 0.20          # Allow up to 20% of portfolio in XBT
+    hard_cap_units: "0.1"         # Absolute ceiling regardless of portfolio size
+    # Inventory targets as fraction of max_inventory_base
+    target_inventory_long_ratio: 0.5
+    target_inventory_neutral_ratio: 0.0
+    target_inventory_short_ratio: 0.0
+    # Behaviour switches
+    quote_only_with_signal: false  # If true, skip NEUTRAL pairs entirely
+    volatility_widening: true      # Widen spread when book spread is unusually wide
+    vol_widening_threshold_bps: 50.0
+    max_vol_widening_factor: 3.0
+    order_cooldown_sec: 1.5        # Minimum time between order actions per side
+
+  ETHMYR:
+    enabled: false
+    hl_symbol: ETH
+    base_spread_bps: 25.0
+    min_spread_bps: 10.0
+    momentum_long_skew_bps: 10.0
+    momentum_short_skew_bps: 10.0
+    inventory_skew_factor: 1.5
+    cancel_replace_threshold_bps: 6.0
+    quote_size_base: "0.005"
+    max_inventory_base: "0.05"
+    max_notional_myr: 5000.0
+    allocation_pct: 0.10          # Allow up to 10% of portfolio in ETH
+    hard_cap_units: "0.5"
+    target_inventory_long_ratio: 0.5
+    target_inventory_neutral_ratio: 0.0
+    target_inventory_short_ratio: 0.0
+    quote_only_with_signal: false
+    volatility_widening: true
+    vol_widening_threshold_bps: 60.0
+    max_vol_widening_factor: 3.0
+    order_cooldown_sec: 1.5
+
+  XRPMYR:
+    enabled: false
+    hl_symbol: XRP
+    base_spread_bps: 30.0
+    min_spread_bps: 12.0
+    momentum_long_skew_bps: 12.0
+    momentum_short_skew_bps: 12.0
+    inventory_skew_factor: 2.0
+    cancel_replace_threshold_bps: 8.0
+    quote_size_base: "10.0"
+    max_inventory_base: "100.0"
+    max_notional_myr: 3000.0
+    allocation_pct: 0.05          # Allow up to 5% of portfolio in XRP
+    hard_cap_units: "1000.0"
+    target_inventory_long_ratio: 0.5
+    target_inventory_neutral_ratio: 0.0
+    target_inventory_short_ratio: 0.0
+    quote_only_with_signal: false
+    volatility_widening: true
+    vol_widening_threshold_bps: 80.0
+    max_vol_widening_factor: 3.0
+    order_cooldown_sec: 2.0
+
+  SOLMYR:
+    enabled: false               # Enable once you've verified pair is active on Luno MY
+    hl_symbol: SOL
+    base_spread_bps: 30.0
+    min_spread_bps: 12.0
+    momentum_long_skew_bps: 12.0
+    momentum_short_skew_bps: 12.0
+    inventory_skew_factor: 2.0
+    cancel_replace_threshold_bps: 8.0
+    quote_size_base: "0.1"
+    max_inventory_base: "1.0"
+    max_notional_myr: 2000.0
+    target_inventory_long_ratio: 0.5
+    target_inventory_neutral_ratio: 0.0
+    target_inventory_short_ratio: 0.0
+    quote_only_with_signal: true  # Only quote when signal is LONG or SHORT
+    volatility_widening: true
+    vol_widening_threshold_bps: 80.0
+    max_vol_widening_factor: 3.0
+    order_cooldown_sec: 2.0
+
+  LTCMYR:
+    enabled: false
+    hl_symbol: LTC
+    base_spread_bps: 35.0
+    min_spread_bps: 14.0
+    momentum_long_skew_bps: 14.0
+    momentum_short_skew_bps: 14.0
+    inventory_skew_factor: 2.0
+    cancel_replace_threshold_bps: 10.0
+    quote_size_base: "0.1"
+    max_inventory_base: "1.0"
+    max_notional_myr: 1500.0
+    target_inventory_long_ratio: 0.5
+    target_inventory_neutral_ratio: 0.0
+    target_inventory_short_ratio: 0.0
+    quote_only_with_signal: true
+    volatility_widening: true
+    vol_widening_threshold_bps: 100.0
+    max_vol_widening_factor: 3.0
+    order_cooldown_sec: 2.0
