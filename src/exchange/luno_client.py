@@ -289,9 +289,9 @@ class LunoClient:
         return order
 
     async def cancel_order(self, order_id: str) -> bool:
-        """Cancel an order. Returns True on success, False if already gone."""
+        """Cancel an order via POST /api/1/stoporder. Returns True on success."""
         try:
-            await self._request("DELETE", f"/api/1/orders/{order_id}")
+            await self._request("POST", "/api/1/stoporder", data={"order_id": order_id})
             log.info('"order cancelled"', extra={"order_id": order_id})
             return True
         except aiohttp.ClientResponseError as exc:
@@ -318,7 +318,7 @@ class LunoClient:
             )
             return []
         orders: list[Order] = []
-        for o in data.get("orders", []):
+        for o in (data.get("orders") or []):
             try:
                 orders.append(
                     Order(
