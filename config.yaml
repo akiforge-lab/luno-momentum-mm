@@ -48,6 +48,40 @@ signal:
   # Increase cautiously as confidence grows.
   max_active_long_pairs: 2
 
+
+# ── Candidate universe ───────────────────────────────────────────────────────────────────
+# auto_discover: fetch ALL active Luno MYR pairs at startup and add them
+# to the quoting universe with default_params below. Pairs already listed
+# under  keep their explicit config; new pairs get defaults.
+universe:
+  auto_discover: true
+  # Pairs permanently excluded from the universe regardless of signal.
+  exclude_pairs:
+    - PAXGMYR       # Gold-pegged (PAXG/oz), not a crypto momentum play
+  # Conservative defaults injected for every auto-discovered pair.
+  # quote_size_base  = min_volume x quote_size_multiplier  (>= exchange minimum)
+  # hard_cap_units   = min_volume x hard_cap_multiplier
+  # max_inventory_base is set equal to quote_size_base (minimal starting position)
+  default_params:
+    base_spread_bps: 30.0
+    min_spread_bps: 15.0
+    momentum_long_skew_bps: 12.0
+    momentum_short_skew_bps: 12.0
+    inventory_skew_factor: 2.0
+    cancel_replace_threshold_bps: 8.0
+    max_notional_myr: 500.0          # Hard MYR cap per auto-discovered pair
+    allocation_pct: 0.02             # 2 % of portfolio -> dynamic limit
+    quote_size_multiplier: 1         # quote_size = min_volume x 1
+    hard_cap_multiplier: 200         # hard_cap   = min_volume x 200
+    target_inventory_long_ratio: 0.5
+    target_inventory_neutral_ratio: 0.0
+    target_inventory_short_ratio: 0.0
+    quote_only_with_signal: true     # Only place quotes when LONG/SHORT signal
+    volatility_widening: true
+    vol_widening_threshold_bps: 80.0
+    max_vol_widening_factor: 3.0
+    order_cooldown_sec: 2.0
+
 # ── Global risk limits ───────────────────────────────────────
 risk:
   # Set to true to cancel all orders and halt quoting immediately
@@ -96,7 +130,7 @@ pairs:
     order_cooldown_sec: 1.5        # Minimum time between order actions per side
 
   ETHMYR:
-    enabled: false
+    enabled: true
     hl_symbol: ETH
     base_spread_bps: 25.0
     min_spread_bps: 10.0
@@ -119,7 +153,7 @@ pairs:
     order_cooldown_sec: 1.5
 
   XRPMYR:
-    enabled: false
+    enabled: true
     hl_symbol: XRP
     base_spread_bps: 30.0
     min_spread_bps: 12.0
@@ -211,7 +245,7 @@ pairs:
     order_cooldown_sec: 3.0
 
   LTCMYR:
-    enabled: false
+    enabled: true
     hl_symbol: LTC
     base_spread_bps: 35.0
     min_spread_bps: 14.0
@@ -222,6 +256,8 @@ pairs:
     quote_size_base: "0.1"
     max_inventory_base: "1.0"
     max_notional_myr: 1500.0
+    allocation_pct: 0.05
+    hard_cap_units: "5.0"
     target_inventory_long_ratio: 0.5
     target_inventory_neutral_ratio: 0.0
     target_inventory_short_ratio: 0.0

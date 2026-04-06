@@ -47,18 +47,36 @@ log = get_logger(__name__)
 # Maps Hyperliquid coin symbols to Luno pair codes.
 # No longer on the hot path — classification now uses Luno pairs directly.
 HL_TO_LUNO: dict[str, str] = {
-    "BTC":   "XBTMYR",
-    "ETH":   "ETHMYR",
-    "XRP":   "XRPMYR",
-    "SOL":   "SOLMYR",
-    "LTC":   "LTCMYR",
-    "BCH":   "BCHMYR",
-    "ADA":   "ADAMYR",
-    "DOT":   "DOTMYR",
-    "LINK":  "LINKMYR",
-    "UNI":   "UNIMYR",
-    "MATIC": "MATICMYR",
-    "DOGE":  "DOGEMYR",
+    "BTC":    "XBTMYR",
+    "ETH":    "ETHMYR",
+    "XRP":    "XRPMYR",
+    "SOL":    "SOLMYR",
+    "LTC":    "LTCMYR",
+    "BCH":    "BCHMYR",
+    "ADA":    "ADAMYR",
+    "DOT":    "DOTMYR",
+    "LINK":   "LINKMYR",
+    "UNI":    "UNIMYR",
+    "AAVE":   "AAVEMYR",
+    "ALGO":   "ALGOMYR",
+    "ARB":    "ARBMYR",
+    "ATOM":   "ATOMMYR",
+    "AVAX":   "AVAXMYR",
+    "CRV":    "CRVMYR",
+    "GRT":    "GRTMYR",
+    "HBAR":   "HBARMYR",
+    "JUP":    "JUPMYR",
+    "NEAR":   "NEARMYR",
+    "ONDO":   "ONDOMYR",
+    "POL":    "POLMYR",
+    "RENDER": "RENDERMYR",
+    "SKY":    "SKYMYR",
+    "SNX":    "SNXMYR",
+    "SUI":    "SUIMYR",
+    "TAO":    "TAOMYR",
+    "TON":    "TONMYR",
+    "TRX":    "TRXMYR",
+    "XLM":    "XLMMYR",
 }
 LUNO_TO_HL: dict[str, str] = {v: k for k, v in HL_TO_LUNO.items()}
 
@@ -182,6 +200,10 @@ class SignalAdapter:
         self._last_refresh: float = 0.0
 
     # ── Public interface ──────────────────────────────────────────────────
+
+    def set_pairs(self, pairs: list[str]) -> None:
+        """Update the pair list after runtime discovery of new pairs."""
+        self._pairs = list(pairs)
 
     def get(self, luno_pair: str) -> Signal:
         return self._signals.get(luno_pair, self._neutral(luno_pair))

@@ -356,6 +356,34 @@ class LunoClient:
         )
         return data.get("candles", [])
 
+    async def get_all_market_infos(self) -> dict[str, "MarketInfo"]:
+        """
+        Fetch all market pairs in a single API call.
+        Returns {market_id: MarketInfo} for every pair on the exchange.
+        Useful for bulk discovery — far more efficient than N get_market_info() calls.
+        """
+        data = await self._request("GET", "/api/exchange/1/markets")
+        result: dict[str, MarketInfo] = {}
+        for m in data.get("markets", []):
+            pair = m.get("market_id")
+            if not pair:
+                continue
+            price_scale = int(m.get("price_scale", 2))
+            volume_scale = int(m.get("volume_scale", 8))
+            tick = Decimal(10) ** -price_scale
+            result[pair] = MarketInfo(
+                pair=pair,
+                min_volume=Decimal(str(m.get("min_volume", "0"))),
+                max_volume=Decimal(str(m.get("max_volume", "0"))),
+                volume_scale=volume_scale,
+                price_scale=price_scale,
+                tick_size=tick,
+                min_price=Decimal(str(m.get("min_price", "0"))),
+                max_price=Decimal(str(m.get("max_price", "99999999"))),
+                status=m.get("trading_status", "ACTIVE"),
+            )
+        return result
+
     async def cancel_all_open_orders(self, pair: str) -> int:
         """Cancel every open order for a pair. Returns count cancelled."""
         orders = await self.get_open_orders(pair)

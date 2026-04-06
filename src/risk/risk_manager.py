@@ -138,6 +138,17 @@ class RiskManager:
             self._pair_cfg[pair].kill_switch = val
             log.warning('"pair kill switch"', extra={"pair": pair, "kill": val})
 
+    def add_pair(self, cfg: PairRiskConfig) -> None:
+        """Register a new pair at runtime (e.g. from auto-discovery). No-op if already registered."""
+        if cfg.pair in self._pair_cfg:
+            return
+        self._pair_cfg[cfg.pair] = cfg
+        self._metrics[cfg.pair] = PairMetrics(pair=cfg.pair)
+        self._cost_basis[cfg.pair] = _ZERO
+        self._dynamic_max[cfg.pair] = (
+            cfg.hard_cap_units if cfg.hard_cap_units > _ZERO else cfg.max_inventory_base
+        )
+
     # ── Dynamic inventory limits ──────────────────────────────────────────
 
     def update_portfolio_value(self, value_myr: Decimal) -> None:

@@ -88,6 +88,8 @@ class MomentumMarketMaker:
         filter_pairs: Optional[list[str]] = None,
     ) -> None:
         self._cfg = config
+        self._api_key = api_key
+        self._api_secret = api_secret
         self._dry_run = dry_run
         self._record = record
 
@@ -144,15 +146,7 @@ class MomentumMarketMaker:
 
         self._ws: dict[str, LunoWebSocket] = {}
         for pair in self._pairs:
-            rec_path = f"data/recordings/{pair}.jsonl" if record else None
-            ws = LunoWebSocket(
-                pair=pair,
-                api_key=api_key,
-                api_secret=api_secret,
-                on_trade=self._order_mgr.on_trade,
-                record_path=rec_path,
-            )
-            self._ws[pair] = ws
+            self._ws[pair] = self._create_ws(pair)
 
         # ── Market info cache ──────────────────────────────────────────────
 
@@ -171,6 +165,8 @@ class MomentumMarketMaker:
         self._pair_modes: dict[str, str] = {}
         # Rank among LONG candidates (1 = highest score); 0 = not LONG
         self._pair_ranks: dict[str, int] = {}
+        # Pairs excluded from universe with reasons (for dashboard/logs)
+        self._excluded_pairs: dict[str, str] = {}
 
         # ── Timing ────────────────────────────────────────────────────────
 
@@ -195,6 +191,16 @@ class MomentumMarketMaker:
         self._last_fee_refresh: float = 0.0
         self._last_balance_sync: float = 0.0
 
+    def _create_ws(self, pair: str) -> LunoWebSocket:
+        rec_path = f"data/recordings/{pair}.jsonl" if self._record else None
+        return LunoWebSocket(
+            pair=pair,
+            api_key=self._api_key,
+            api_secret=self._api_secret,
+            on_trade=self._order_mgr.on_trade,
+            record_path=rec_path,
+        )
+
     # ── Startup / shutdown ─────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -209,8 +215,9 @@ class MomentumMarketMaker:
             self._risk.load_state_dict(saved["risk"])
             log.info('"state restored from disk"')
 
-        # Fetch initial market info and fees
-        await self._refresh_market_info()
+        # Discover universe and fetch all market info in a single API call.
+        # If auto_discover is enabled, also expands self._pairs with new MYR pairs.
+        await self._discover_universe()
 
         # Validate pairs against live Luno markets — drop unsupported/inactive
         await self._validate_active_pairs()
@@ -514,9 +521,60 @@ class MomentumMarketMaker:
                 log.warning('"reconcile error"', extra={"pair": pair, "error": str(exc)})
 
     async def _refresh_market_info(self) -> None:
+        """Refresh market info for all active pairs — single bulk API call."""
+        try:
+            all_infos = await self._client.get_all_market_infos()
+        except Exception as exc:
+            log.error('"market info refresh error"', extra={"error": str(exc)})
+            return
         for pair in self._pairs:
-            try:
-                info = await self._client.get_market_info(pair)
+            info = all_infos.get(pair)
+            if info is None:
+                log.error('"market info missing"', extra={"pair": pair})
+                continue
+            self._market_info[pair] = info
+            log.info(
+                '"market info loaded"',
+                extra={
+                    "pair": pair,
+                    "min_vol": str(info.min_volume),
+                    "price_scale": info.price_scale,
+                    "status": info.status,
+                },
+            )
+
+    async def _discover_universe(self) -> None:
+        """
+        Single-call market discovery. Always:
+          - Fetches all market infos from Luno in one API call.
+          - Pre-populates self._market_info for all pre-configured pairs.
+        If universe.auto_discover is enabled, also:
+          - Scans all ACTIVE MYR pairs not already in self._pairs.
+          - Applies exclusion list and config_disabled filter.
+          - Injects default config for newly discovered pairs.
+          - Creates WS handlers, registers with risk manager.
+          - Logs each pair's fate (auto-discovered / excluded / reason).
+        """
+        uni_cfg = self._cfg.get("universe", {})
+        auto_discover = bool(uni_cfg.get("auto_discover", False))
+        exclude_set = set(uni_cfg.get("exclude_pairs", []))
+        default_params: dict = uni_cfg.get("default_params", {})
+        q_mult = Decimal(str(default_params.get("quote_size_multiplier", "1")))
+        hc_mult = Decimal(str(default_params.get("hard_cap_multiplier", "200")))
+
+        # Single bulk API call
+        try:
+            all_markets = await self._client.get_all_market_infos()
+        except Exception as exc:
+            log.error('"universe discovery failed — falling back to per-pair fetch"',
+                      extra={"error": str(exc)})
+            await self._refresh_market_info()
+            return
+
+        # Always: populate market info for pre-configured pairs
+        for pair in list(self._pairs):
+            info = all_markets.get(pair)
+            if info is not None:
                 self._market_info[pair] = info
                 log.info(
                     '"market info loaded"',
@@ -527,8 +585,106 @@ class MomentumMarketMaker:
                         "status": info.status,
                     },
                 )
-            except Exception as exc:
-                log.error('"market info error"', extra={"pair": pair, "error": str(exc)})
+            else:
+                log.error('"market info missing"', extra={"pair": pair})
+
+        if not auto_discover:
+            return
+
+        pre_existing = set(self._pairs)
+        added: list[str] = []
+        excluded: dict[str, str] = {}
+
+        for pair in sorted(all_markets.keys()):
+            if not pair.endswith("MYR"):
+                continue
+
+            if pair in pre_existing:
+                continue  # already configured
+
+            market = all_markets[pair]
+
+            # Exclusion checks (logged below)
+            if pair in exclude_set:
+                excluded[pair] = "explicit_exclude"
+                continue
+
+            cfg_pair = self._cfg.get("pairs", {}).get(pair, {})
+            if cfg_pair.get("enabled") is False:
+                excluded[pair] = "config_disabled"
+                continue
+
+            if market.status != "ACTIVE":
+                excluded[pair] = f"not_active:{market.status}"
+                continue
+
+            # Build injected default config
+            quote_size = market.min_volume * q_mult
+            hard_cap = market.min_volume * hc_mult
+            base_asset = pair[:-3]  # strip "MYR"
+
+            injected: dict = {
+                "enabled": True,
+                "hl_symbol": base_asset,
+                "quote_size_base": str(quote_size),
+                "max_inventory_base": str(quote_size),
+                "hard_cap_units": str(hard_cap),
+            }
+            for k, v in default_params.items():
+                if k not in ("quote_size_multiplier", "hard_cap_multiplier"):
+                    injected.setdefault(k, v)
+
+            # Merge: explicit config keys win over defaults
+            if pair not in self._cfg["pairs"]:
+                self._cfg["pairs"][pair] = injected
+            else:
+                for k, v in injected.items():
+                    if k not in self._cfg["pairs"][pair]:
+                        self._cfg["pairs"][pair][k] = v
+
+            # Register pair
+            self._pairs.append(pair)
+            self._market_info[pair] = market
+            self._ws[pair] = self._create_ws(pair)
+            prc = PairRiskConfig.from_dict(pair, self._cfg["pairs"][pair])
+            self._risk.add_pair(prc)
+            cooldown = float(self._cfg["pairs"][pair].get("order_cooldown_sec", 2.0))
+            self._order_mgr.set_pair_cooldown(pair, cooldown)
+            added.append(pair)
+
+            log.info(
+                '"pair auto-discovered"',
+                extra={
+                    "pair": pair,
+                    "quote_size": str(quote_size),
+                    "min_volume": str(market.min_volume),
+                    "max_notional": str(default_params.get("max_notional_myr", 500)),
+                },
+            )
+
+        # Update signal adapter with the now-complete pair list
+        self._signals.set_pairs(self._pairs)
+
+        # Store for dashboard
+        self._excluded_pairs = excluded
+
+        # Summary log
+        myr_total = len([p for p in all_markets if p.endswith("MYR")])
+        log.info(
+            '"universe discovery complete"',
+            extra={
+                "myr_pairs_on_exchange": myr_total,
+                "added": sorted(added),
+                "excluded": sorted(excluded.keys()),
+                "total_active_pairs": len(self._pairs),
+            },
+        )
+        for pair, reason in sorted(excluded.items()):
+            log.info(
+                '"pair excluded from universe"',
+                extra={"pair": pair, "reason": reason},
+            )
+        _dashboard.update_universe(excluded)
 
     async def _refresh_fees(self) -> None:
         for pair in self._pairs:
@@ -633,6 +789,7 @@ class MomentumMarketMaker:
                 "max_long_cap": self._max_long_pairs,
             },
         )
+        _dashboard.update_universe(self._excluded_pairs)
 
     async def _validate_active_pairs(self) -> None:
         """

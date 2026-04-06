@@ -45,6 +45,14 @@ def update_pair(pair: str, data: dict) -> None:
     _bot_state["pairs"][pair] = data
 
 
+_universe_excluded: dict[str, str] = {}   # pair → exclusion reason
+
+
+def update_universe(excluded: dict[str, str]) -> None:
+    global _universe_excluded
+    _universe_excluded = dict(excluded)
+
+
 # ── Stub data for --no-auth mode ──────────────────────────────────────────────
 
 _STUB_PAIRS = {
@@ -140,6 +148,19 @@ async def _handle_state(_request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+async def _handle_universe(_request: web.Request) -> web.Response:
+    """Return full universe status: active pairs + excluded pairs with reasons."""
+    active = [
+        {"pair": p, "mode": d.get("pair_mode", "unknown"), "signal": d.get("signal", "NEUTRAL")}
+        for p, d in _bot_state["pairs"].items()
+    ]
+    excluded = [
+        {"pair": p, "reason": r}
+        for p, r in sorted(_universe_excluded.items())
+    ]
+    return web.json_response({"active": active, "excluded": excluded})
+
+
 # ── Server lifecycle ──────────────────────────────────────────────────────────
 
 
@@ -150,6 +171,7 @@ async def run(host: str = "127.0.0.1", port: int = 8088, offline: bool = False) 
     app = web.Application()
     app.router.add_get("/", _handle_index)
     app.router.add_get("/api/state", _handle_state)
+    app.router.add_get("/api/universe", _handle_universe)
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -236,6 +258,17 @@ footer{padding:6px 18px;font-size:10px;color:#45475a;border-top:1px solid #18182
   <div class="grid" id="dgrid"></div>
 </div>
 </main>
+<div id="univ" style="margin-top:14px;display:none">
+  <div style="color:#585b70;font-size:10px;margin-bottom:6px;cursor:pointer" onclick="document.getElementById('univbody').style.display=document.getElementById('univbody').style.display==='none'?'block':'none'">
+    ▸ EXCLUDED FROM UNIVERSE <span id="univcount"></span>
+  </div>
+  <div id="univbody" style="display:none">
+    <table style="font-size:10px;color:#45475a">
+    <thead><tr><th style="text-align:left;padding:3px 7px">Pair</th><th style="text-align:left;padding:3px 7px">Exclusion reason</th></tr></thead>
+    <tbody id="univtbody"></tbody>
+    </table>
+  </div>
+</div>
 <footer id="foot">Auto-refresh every 3 s</footer>
 <script>
 'use strict';
@@ -333,6 +366,19 @@ async function refresh(){
     renderTable(data.pairs||[]);
     renderDetail();
     document.getElementById('foot').textContent='Auto-refresh every 3 s — '+data.pairs.length+' pair(s) active';
+    try{
+      const ur=await fetch('/api/universe');
+      const ud=await ur.json();
+      const excl=ud.excluded||[];
+      const uDiv=document.getElementById('univ');
+      const uTb=document.getElementById('univtbody');
+      const uCnt=document.getElementById('univcount');
+      if(excl.length>0){
+        uDiv.style.display='block';
+        uCnt.textContent='('+excl.length+')';
+        uTb.innerHTML=excl.map(e=>`<tr><td style="padding:3px 7px"><b>${e.pair}</b></td><td style="padding:3px 7px">${e.reason}</td></tr>`).join('');
+      }
+    }catch(_){}
   }catch(e){document.getElementById('foot').textContent='⚠ '+e;}
 }
 refresh();setInterval(refresh,3000);
