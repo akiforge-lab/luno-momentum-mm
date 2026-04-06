@@ -56,8 +56,7 @@ signal:
 universe:
   auto_discover: true
   # Pairs permanently excluded from the universe regardless of signal.
-  exclude_pairs:
-    - PAXGMYR       # Gold-pegged (PAXG/oz), not a crypto momentum play
+  exclude_pairs: []  # No permanent exclusions — all ACTIVE pairs are candidates
   # Conservative defaults injected for every auto-discovered pair.
   # quote_size_base  = min_volume x quote_size_multiplier  (>= exchange minimum)
   # hard_cap_units   = min_volume x hard_cap_multiplier
@@ -266,3 +265,28 @@ pairs:
     vol_widening_threshold_bps: 100.0
     max_vol_widening_factor: 3.0
     order_cooldown_sec: 2.0
+
+  PAXGMYR:
+    enabled: true
+    hl_symbol: PAXG
+    # PAXG tracks gold (XAU). Same OLS momentum model applies, but gold has
+    # lower volatility and different liquidity profile — sized conservatively.
+    base_spread_bps: 40.0
+    min_spread_bps: 20.0
+    momentum_long_skew_bps: 12.0
+    momentum_short_skew_bps: 12.0
+    inventory_skew_factor: 2.0
+    cancel_replace_threshold_bps: 10.0
+    quote_size_base: "0.0001"      # 1× min_volume (~1.2 MYR/order at current price)
+    max_inventory_base: "0.0001"
+    max_notional_myr: 200.0        # Conservative vs 500 MYR default
+    allocation_pct: 0.01           # 1% portfolio (vs 2% default)
+    hard_cap_units: "0.02"         # 200× min_vol ceiling
+    target_inventory_long_ratio: 0.5
+    target_inventory_neutral_ratio: 0.0
+    target_inventory_short_ratio: 0.0
+    quote_only_with_signal: true
+    volatility_widening: true
+    vol_widening_threshold_bps: 80.0
+    max_vol_widening_factor: 3.0
+    order_cooldown_sec: 3.0
