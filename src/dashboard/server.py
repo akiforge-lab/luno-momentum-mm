@@ -107,6 +107,10 @@ def seed_stub_data() -> None:
             "inv_shift_bps":   round(-(inv_ratio * 1.5 * half / s["mid"] * 10_000), 2),
             "mom_shift_bps":   8.0 if is_long else (-8.0 if s["signal"] == "SHORT" else 0.0),
             "half_bps":        round(half / s["mid"] * 10_000, 2),
+            # Universe / ranking (stub)
+            "pair_mode":       "bid-enabled" if is_long else ("inventory-only" if s["inv"] > 0 else "not-long"),
+            "bid_enabled":     is_long,
+            "bid_rank":        1 if is_long else 0,
             # Status
             "ws_connected":    False,
             "ws_age_sec":      0.0,
@@ -216,8 +220,8 @@ footer{padding:6px 18px;font-size:10px;color:#45475a;border-top:1px solid #18182
 <main>
 <table>
 <thead><tr>
-  <th>Pair</th><th>Signal</th>
-  <th>Slope%/yr</th><th>R²</th><th>Score</th>
+  <th>Pair</th><th>Mode</th><th>Signal</th>
+  <th>Slope%/yr</th><th>R²</th><th>Score</th><th>Rank</th>
   <th>Mid</th><th>ResMid</th>
   <th>Bid Px</th><th>Bid Sz</th>
   <th>Ask Px</th><th>Ask Sz</th>
@@ -252,9 +256,12 @@ function renderTable(pairs){
     if(d.pair===sel)tr.className='sel';
     tr.onclick=()=>{sel=sel===d.pair?null:d.pair;renderDetail();renderTable(Object.values(cache))};
     const[wc,wl]=fws(d);const[qc,ql]=fq(d);
+    const modeClass=d.pair_mode==='bid-enabled'?'ok':d.pair_mode==='inventory-only'?'warn':'zero';
     tr.innerHTML=`<td><b>${d.pair}</b></td>`+
+      `<td class="${modeClass}">${d.pair_mode||'—'}</td>`+
       `<td class="${d.signal||'NEUTRAL'}">${d.signal||'—'}</td>`+
       `<td>${f(d.slope_ann_pct,1)}%</td><td>${f(d.r2,3)}</td><td>${f(d.momentum_score,1)}</td>`+
+      `<td>${d.bid_rank||'—'}</td>`+
       `<td>${f(d.mid,2)}</td><td>${f(d.reservation_mid,2)}</td>`+
       `<td>${f(d.bid_price,2)}</td><td>${f(d.bid_size,6)}</td>`+
       `<td>${f(d.ask_price,2)}</td><td>${f(d.ask_size,6)}</td>`+
@@ -278,7 +285,11 @@ function renderDetail(){
   const dynMax=d.dynamic_max_inventory!=null?f(d.dynamic_max_inventory,6)+' base':'—';
   const allocPct=d.allocation_pct!=null?(d.allocation_pct*100).toFixed(0)+'%':'—';
   const portVal=d.portfolio_value_myr!=null?f(d.portfolio_value_myr,2)+' MYR':'—';
+  const modeClass=d.pair_mode==='bid-enabled'?'ok':d.pair_mode==='inventory-only'?'warn':'zero';
   const cards=[
+    ['Universe mode', `<span class="${modeClass}">${d.pair_mode||'—'}</span>`],
+    ['Bid enabled', d.bid_enabled?'<span class="ok">yes</span>':'<span class="zero">no</span>'],
+    ['LONG rank', d.bid_rank>0?`#${d.bid_rank}`:'—'],
     ['Portfolio value', portVal],
     ['Allocation %', allocPct],
     ['Dynamic max inventory', dynMax],

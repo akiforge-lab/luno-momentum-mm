@@ -162,6 +162,16 @@ class MomentumMarketMaker:
         # ── Portfolio tracking ────────────────────────────────────────────
         self._myr_balance: Decimal = Decimal("0")
 
+        # ── Universe ranking ──────────────────────────────────────────────
+        sig_cfg = config.get("signal", {})
+        self._max_long_pairs: int = int(sig_cfg.get("max_active_long_pairs", 2))
+        # Pairs currently allowed to place new bids (top-N LONG by score)
+        self._bid_enabled_pairs: set[str] = set()
+        # Observability: mode string per pair
+        self._pair_modes: dict[str, str] = {}
+        # Rank among LONG candidates (1 = highest score); 0 = not LONG
+        self._pair_ranks: dict[str, int] = {}
+
         # ── Timing ────────────────────────────────────────────────────────
 
         self._quote_interval = float(config.get("quote_interval_sec", 2.0))
@@ -213,8 +223,9 @@ class MomentumMarketMaker:
         # Sync real balances before first quote tick
         await self._sync_balances()
 
-        # Run initial momentum classification
+        # Run initial momentum classification and rank bid-enabled pairs
         await self._signals.refresh()
+        self._update_bid_enabled_pairs()
 
     async def shutdown(self) -> None:
         log.info('"shutting down"')
@@ -317,7 +328,8 @@ class MomentumMarketMaker:
                 log.warning('"quote suppressed"', extra={"pair": pair, "reason": reason})
             await self._order_mgr.cancel_pair(pair)
             self._risk.record_quote_tick(pair, False)
-            self._push_dashboard(pair, None, None, orderbook, ws, reason)
+            self._push_dashboard(pair, None, None, orderbook, ws, reason,
+                                  self._pair_modes.get(pair, "inactive"))
             return
 
         # ── Get signal ─────────────────────────────────────────────────────
@@ -339,7 +351,8 @@ class MomentumMarketMaker:
         if quote is None:
             await self._order_mgr.sync(pair, None, qcfg.cancel_replace_threshold_bps)
             self._risk.record_quote_tick(pair, False)
-            self._push_dashboard(pair, signal, None, orderbook, ws, "no_quote")
+            self._push_dashboard(pair, signal, None, orderbook, ws, "no_quote",
+                                  self._pair_modes.get(pair, "standby"))
             return
 
         # ── Pre-order risk checks ──────────────────────────────────────────
@@ -354,6 +367,21 @@ class MomentumMarketMaker:
             if not ok_ask:
                 quote.ask_size = Decimal("0")
                 log.debug('"ask suppressed"', extra={"pair": pair, "reason": reason_ask})
+
+        # ── Rank-based bid suppression ─────────────────────────────────────
+        # Even if signal is LONG and risk permits, suppress bids for pairs
+        # outside the top-N cap. Asks are always allowed to reduce inventory.
+        if quote.bid_size > 0 and pair not in self._bid_enabled_pairs:
+            quote.bid_size = Decimal("0")
+            log.debug(
+                '"bid suppressed by rank"',
+                extra={"pair": pair, "mode": self._pair_modes.get(pair, "standby")},
+            )
+
+        # Effective mode for dashboard: refine to inventory-only when applicable
+        pair_mode = self._pair_modes.get(pair, "standby")
+        if pair not in self._bid_enabled_pairs and inventory >= market.min_volume:
+            pair_mode = "inventory-only"
 
         both_quoted = quote.bid_size > 0 and quote.ask_size > 0
         self._risk.record_quote_tick(pair, both_quoted)
@@ -385,11 +413,12 @@ class MomentumMarketMaker:
                 for fill in new_fills:
                     self._risk.process_fill(fill)
 
-        self._push_dashboard(pair, signal, quote, orderbook, ws, "")
+        self._push_dashboard(pair, signal, quote, orderbook, ws, "", pair_mode)
 
     # ── Dashboard state push ──────────────────────────────────────────────
 
-    def _push_dashboard(self, pair, signal, quote, orderbook, ws, halt_reason):
+    def _push_dashboard(self, pair, signal, quote, orderbook, ws, halt_reason,
+                        pair_mode: str = "standby"):
         if not self._dash_enabled:
             return
         m = self._risk.metrics(pair)
@@ -428,6 +457,10 @@ class MomentumMarketMaker:
             "inv_shift_bps":   quote.inv_shift_bps if quote else None,
             "mom_shift_bps":   quote.mom_shift_bps if quote else None,
             "half_bps":        quote.half_bps if quote else None,
+            # Universe / ranking
+            "pair_mode":       pair_mode,
+            "bid_enabled":     pair in self._bid_enabled_pairs,
+            "bid_rank":        self._pair_ranks.get(pair, 0),
             # Status
             "ws_connected":    ws.is_connected,
             "ws_age_sec":      orderbook.last_update_age_sec(),
@@ -446,6 +479,7 @@ class MomentumMarketMaker:
 
             if now - self._last_signal_refresh >= self._signal_refresh_interval:
                 await self._signals.refresh()
+                self._update_bid_enabled_pairs()
                 self._last_signal_refresh = now
 
             if now - self._last_state_save >= self._state_save_interval:
@@ -531,6 +565,74 @@ class MomentumMarketMaker:
                 self._risk.sync_inventory(pair, bal)
         except Exception as exc:
             log.warning('"balance sync error"', extra={"error": str(exc)})
+
+    def _update_bid_enabled_pairs(self) -> None:
+        """
+        Rank active pairs by momentum score and determine which ones may place
+        new bids. Called after every signal refresh.
+
+        Mode strings (stored in self._pair_modes, shown in dashboard/logs):
+          "bid-enabled"     — LONG, ranked within max_active_long_pairs cap
+          "rank-cutoff"     — LONG but exceeded cap; asks still allowed
+          "not-long"        — SHORT or NEUTRAL; asks still allowed
+          "below-min-size"  — configured quote_size_base < pair min_volume
+          "inactive"        — market info missing (failed validation)
+        """
+        modes: dict[str, str] = {}
+        ranks: dict[str, int] = {}
+        long_candidates: list[tuple[float, str]] = []  # (score, pair)
+
+        for pair in self._pairs:
+            market = self._market_info.get(pair)
+            if market is None:
+                modes[pair] = "inactive"
+                continue
+
+            # Eligibility: configured quote size must meet exchange minimum
+            pair_cfg = self._cfg["pairs"].get(pair, {})
+            try:
+                quote_size = Decimal(str(pair_cfg.get("quote_size_base", "0")))
+            except Exception:
+                quote_size = Decimal("0")
+            if quote_size < market.min_volume:
+                modes[pair] = "below-min-size"
+                log.warning(
+                    '"pair below min quote size"',
+                    extra={"pair": pair, "quote_size": str(quote_size), "min_volume": str(market.min_volume)},
+                )
+                continue
+
+            sig = self._signals.get(pair)
+            if sig.direction == "LONG":
+                long_candidates.append((sig.momentum_score, pair))
+                modes[pair] = "long-candidate"   # tentative; updated below
+            else:
+                modes[pair] = "not-long"
+
+        # Rank LONG candidates by score descending; assign bid-enabled up to cap
+        long_candidates.sort(key=lambda x: x[0], reverse=True)
+        new_bid_enabled: set[str] = set()
+        for rank_idx, (score, pair) in enumerate(long_candidates):
+            rank_1based = rank_idx + 1
+            ranks[pair] = rank_1based
+            if rank_idx < self._max_long_pairs:
+                new_bid_enabled.add(pair)
+                modes[pair] = "bid-enabled"
+            else:
+                modes[pair] = "rank-cutoff"
+
+        self._bid_enabled_pairs = new_bid_enabled
+        self._pair_modes = modes
+        self._pair_ranks = ranks
+
+        log.info(
+            '"universe ranked"',
+            extra={
+                "bid_enabled": sorted(new_bid_enabled),
+                "long_ranked": [f"{p}({s:.1f})" for s, p in long_candidates],
+                "max_long_cap": self._max_long_pairs,
+            },
+        )
 
     async def _validate_active_pairs(self) -> None:
         """

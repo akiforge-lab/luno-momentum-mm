@@ -43,6 +43,10 @@ signal:
   cache_dir: "data/candles"
   # Signal to use when classification cannot be completed
   fallback_direction: "NEUTRAL"
+  # Maximum number of LONG-ranked pairs allowed to place new bids at any time.
+  # Pairs ranked beyond this cap are demoted to inventory-only / standby mode.
+  # Increase cautiously as confidence grows.
+  max_active_long_pairs: 2
 
 # ── Global risk limits ───────────────────────────────────────
 risk:
@@ -159,6 +163,52 @@ pairs:
     vol_widening_threshold_bps: 80.0
     max_vol_widening_factor: 3.0
     order_cooldown_sec: 2.0
+
+  TRXMYR:
+    enabled: true                # Candidate — runtime validation checks Luno activity
+    hl_symbol: TRX
+    base_spread_bps: 30.0
+    min_spread_bps: 12.0
+    momentum_long_skew_bps: 12.0
+    momentum_short_skew_bps: 12.0
+    inventory_skew_factor: 2.0
+    cancel_replace_threshold_bps: 8.0
+    quote_size_base: "50.0"      # TRX is low-priced; 50 TRX ≈ small notional
+    max_inventory_base: "500.0"
+    max_notional_myr: 1500.0
+    allocation_pct: 0.03
+    hard_cap_units: "2000.0"
+    target_inventory_long_ratio: 0.5
+    target_inventory_neutral_ratio: 0.0
+    target_inventory_short_ratio: 0.0
+    quote_only_with_signal: true
+    volatility_widening: true
+    vol_widening_threshold_bps: 80.0
+    max_vol_widening_factor: 3.0
+    order_cooldown_sec: 2.0
+
+  SKYMYR:
+    enabled: true                # Candidate — runtime validation checks Luno activity
+    hl_symbol: SKY
+    base_spread_bps: 40.0        # Wider spread for lower-liquidity asset
+    min_spread_bps: 15.0
+    momentum_long_skew_bps: 15.0
+    momentum_short_skew_bps: 15.0
+    inventory_skew_factor: 2.0
+    cancel_replace_threshold_bps: 10.0
+    quote_size_base: "20.0"      # Must be >= Luno min_vol of 10 SKY
+    max_inventory_base: "200.0"
+    max_notional_myr: 500.0
+    allocation_pct: 0.02
+    hard_cap_units: "500.0"
+    target_inventory_long_ratio: 0.5
+    target_inventory_neutral_ratio: 0.0
+    target_inventory_short_ratio: 0.0
+    quote_only_with_signal: true
+    volatility_widening: true
+    vol_widening_threshold_bps: 100.0
+    max_vol_widening_factor: 3.0
+    order_cooldown_sec: 3.0
 
   LTCMYR:
     enabled: false

@@ -292,6 +292,10 @@ class LunoWebSocket:
         except json.JSONDecodeError:
             return
 
+        # Luno occasionally sends non-dict keepalive frames (e.g. "1")
+        if not isinstance(msg, dict):
+            return
+
         # Distinguish snapshot (has "asks"/"bids" top-level arrays) from update
         if "asks" in msg or "bids" in msg:
             self.orderbook.apply_snapshot(msg)
