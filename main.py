@@ -295,14 +295,16 @@ class MomentumMarketMaker:
                 self._risk.set_global_kill(True)
 
             # Compute portfolio value: MYR balance + sum(inventory × mid) for all pairs
-            portfolio_value = self._myr_balance
+            total_inv_value = Decimal("0")
             for p in self._pairs:
                 ws_p = self._ws.get(p)
                 if ws_p:
                     mid_p = ws_p.orderbook.mid()
                     if mid_p:
-                        portfolio_value += self._risk.inventory(p) * mid_p
+                        total_inv_value += self._risk.inventory(p) * mid_p
+            portfolio_value = self._myr_balance + total_inv_value
             self._risk.update_portfolio_value(portfolio_value)
+            self._risk.update_total_inventory_value(total_inv_value)
 
             for pair in self._pairs:
                 try:

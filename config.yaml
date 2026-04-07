@@ -223,8 +223,8 @@ pairs:
   SKYMYR:
     enabled: true                # Candidate — runtime validation checks Luno activity
     hl_symbol: SKY
-    base_spread_bps: 40.0        # Wider spread for lower-liquidity asset
-    min_spread_bps: 15.0
+    base_spread_bps: 60.0        # Raised from 40→60 to clear 50bps fee break-even
+    min_spread_bps: 25.0
     momentum_long_skew_bps: 15.0
     momentum_short_skew_bps: 15.0
     inventory_skew_factor: 2.0

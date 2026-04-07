@@ -118,6 +118,7 @@ class RiskManager:
 
         # Dynamic inventory limits (portfolio-based)
         self._portfolio_value_myr: Decimal = _ZERO
+        self._total_inv_value_myr: Decimal = _ZERO   # sum(inventory[p] * mid[p])
         self._dynamic_max: dict[str, Decimal] = {
             p: (cfg.hard_cap_units if cfg.hard_cap_units > _ZERO else cfg.max_inventory_base)
             for p, cfg in pair_configs.items()
@@ -153,6 +154,10 @@ class RiskManager:
 
     def update_portfolio_value(self, value_myr: Decimal) -> None:
         self._portfolio_value_myr = value_myr
+
+    def update_total_inventory_value(self, value_myr: Decimal) -> None:
+        """Track sum(inventory[p] * mid[p]) across all pairs. Used for portfolio cap."""
+        self._total_inv_value_myr = value_myr
 
     def update_dynamic_max(self, pair: str, mid: Decimal) -> None:
         """Recompute max inventory for pair based on current portfolio value and mid."""
@@ -225,6 +230,15 @@ class RiskManager:
         notional = (m.inventory + size) * price
         if notional > cfg.max_notional_myr:
             return False, f"max_notional ({notional:.2f} > {cfg.max_notional_myr})"
+        # Portfolio-level cap: total inventory value must not exceed portfolio value.
+        # Guards against the case where per-pair allocations sum to >100% of capital.
+        if self._portfolio_value_myr > _ZERO:
+            prospective_total = self._total_inv_value_myr + size * price
+            if prospective_total > self._portfolio_value_myr:
+                return False, (
+                    f"portfolio_cap ({prospective_total:.2f} > "
+                    f"{self._portfolio_value_myr:.2f} MYR)"
+                )
         return True, ""
 
     def can_place_ask(self, pair: str, size: Decimal) -> tuple[bool, str]:
