@@ -1,9 +1,9 @@
 """
-Luno Momentum Market-Maker — CLI entrypoint.
+Luno Momentum Market-Maker  ECLI entrypoint.
 
 Usage
 ─────
-  # Paper mode (default — safe, no real orders)
+  # Paper mode (default  Esafe, no real orders)
   python main.py --dry-run
 
   # Live trading (requires confirmed acknowledgement)
@@ -22,7 +22,7 @@ Usage
 
 Shutdown
 ────────
-  Ctrl-C / SIGTERM → graceful shutdown (cancels open orders if configured).
+  Ctrl-C / SIGTERM ↁEgraceful shutdown (cancels open orders if configured).
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ from src.exchange.luno_client import LunoClient, MarketInfo
 from src.exchange.luno_ws import LunoWebSocket
 from src.orders.order_manager import OrderManager
 from src.quoting.quoting_engine import PairQuoteConfig, QuotingEngine
+from src.regime import ShockDetector
 from src.risk.risk_manager import PairRiskConfig, RiskManager
 from src.signal.signal_adapter import SignalAdapter
 from src.state.state_store import StateStore
@@ -142,6 +143,12 @@ class MomentumMarketMaker:
 
         self._state = StateStore()
 
+        # ???? Shock regime detector ??????????????????????????????????????????????
+        self._shock_cfg = self._cfg.get("shock_regime", {})
+        self._shock_detector = ShockDetector(self._shock_cfg)
+        self._shock_regime: str = "NORMAL"
+        self._shock_enabled = bool(self._shock_cfg.get("enabled", False))
+
         # ── WebSocket handlers ─────────────────────────────────────────────
 
         self._ws: dict[str, LunoWebSocket] = {}
@@ -167,6 +174,9 @@ class MomentumMarketMaker:
         self._pair_ranks: dict[str, int] = {}
         # Pairs excluded from universe with reasons (for dashboard/logs)
         self._excluded_pairs: dict[str, str] = {}
+        # Layer 1: exchange-discovered pairs not in bot_enabled_pairs allowlist.
+        # Tracked for observability but never traded.
+        self._watch_pairs: dict[str, MarketInfo] = {}
 
         # ── Timing ────────────────────────────────────────────────────────
 
@@ -190,6 +200,8 @@ class MomentumMarketMaker:
         self._last_market_info_refresh: float = 0.0
         self._last_fee_refresh: float = 0.0
         self._last_balance_sync: float = 0.0
+        self._shock_refresh_interval = float(self._shock_cfg.get("shock_refresh_interval_sec", 900.0))
+        self._last_shock_refresh: float = 0.0
 
     def _create_ws(self, pair: str) -> LunoWebSocket:
         rec_path = f"data/recordings/{pair}.jsonl" if self._record else None
@@ -219,7 +231,7 @@ class MomentumMarketMaker:
         # If auto_discover is enabled, also expands self._pairs with new MYR pairs.
         await self._discover_universe()
 
-        # Validate pairs against live Luno markets — drop unsupported/inactive
+        # Validate pairs against live Luno markets  Edrop unsupported/inactive
         await self._validate_active_pairs()
 
         await self._refresh_fees()
@@ -233,6 +245,17 @@ class MomentumMarketMaker:
         # Run initial momentum classification and rank bid-enabled pairs
         await self._signals.refresh()
         self._update_bid_enabled_pairs()
+
+        if self._shock_enabled:
+            try:
+                await self._shock_detector.refresh()
+                self._shock_regime = self._shock_detector.regime()
+                self._last_shock_refresh = time.time()
+                components = dict(self._shock_detector.score_components())
+                regime_component = components.pop("regime", self._shock_regime)
+                log.info('"shock_regime_initialized"', extra={"regime": regime_component, **components})
+            except Exception as exc:  # pragma: no cover - startup safeguard
+                log.warning('"shock detector startup refresh failed"', extra={"error": str(exc)})
 
     async def shutdown(self) -> None:
         log.info('"shutting down"')
@@ -294,7 +317,7 @@ class MomentumMarketMaker:
                 log.warning('"kill file detected, activating global kill switch"')
                 self._risk.set_global_kill(True)
 
-            # Compute portfolio value: MYR balance + sum(inventory × mid) for all pairs
+            # Compute portfolio value: MYR balance + sum(inventory ÁEmid) for all pairs
             total_inv_value = Decimal("0")
             for p in self._pairs:
                 ws_p = self._ws.get(p)
@@ -354,8 +377,44 @@ class MomentumMarketMaker:
             self._risk.update_dynamic_max(pair, mid_now)
         qcfg.max_inventory_base = self._risk.effective_max_inventory(pair)
 
+        regime = self._shock_regime
+        force_bid = False
+        target_ratio_override = None
+        spread_multiplier = 1.0
+        accumulation_active = False
+        if self._shock_enabled and self._shock_cfg.get("enabled", False):
+            if regime in ("SHOCK", "PANIC") and self._is_accumulation_pair(pair):
+                accumulation_active = True
+                force_bid = True
+                if regime == "PANIC":
+                    target_ratio_override = float(
+                        self._shock_cfg.get("accumulation_panic_inventory_ratio", 0.95)
+                    )
+                else:
+                    target_ratio_override = float(
+                        self._shock_cfg.get("accumulation_target_inventory_ratio", 0.80)
+                    )
+                target_ratio_override = max(0.0, min(1.0, target_ratio_override))
+                spread_multiplier = float(
+                    self._shock_cfg.get("accumulation_spread_multiplier", 1.5)
+                )
+            elif regime in ("CAUTION", "RECOVERY"):
+                spread_multiplier = float(
+                    self._shock_cfg.get("caution_spread_multiplier", 1.2)
+                )
+
+
         # ── Compute quote ──────────────────────────────────────────────────
-        quote = self._engine.compute(orderbook, signal, inventory, qcfg, market)
+        quote = self._engine.compute(
+            orderbook,
+            signal,
+            inventory,
+            qcfg,
+            market,
+            force_bid=force_bid,
+            target_inventory_ratio_override=target_ratio_override,
+            spread_multiplier=spread_multiplier,
+        )
 
         if quote is None:
             await self._order_mgr.sync(pair, None, qcfg.cancel_replace_threshold_bps)
@@ -381,15 +440,23 @@ class MomentumMarketMaker:
         # Even if signal is LONG and risk permits, suppress bids for pairs
         # outside the top-N cap. Asks are always allowed to reduce inventory.
         if quote.bid_size > 0 and pair not in self._bid_enabled_pairs:
-            quote.bid_size = Decimal("0")
-            log.debug(
-                '"bid suppressed by rank"',
-                extra={"pair": pair, "mode": self._pair_modes.get(pair, "standby")},
-            )
+            if not accumulation_active:
+                quote.bid_size = Decimal("0")
+                log.debug(
+                    '"bid suppressed by rank"',
+                    extra={"pair": pair, "mode": self._pair_modes.get(pair, "standby")},
+                )
+            else:
+                log.debug(
+                    '"bid retained via accumulation"',
+                    extra={"pair": pair, "regime": regime},
+                )
 
         # Effective mode for dashboard: refine to inventory-only when applicable
         pair_mode = self._pair_modes.get(pair, "standby")
-        if pair not in self._bid_enabled_pairs and inventory >= market.min_volume:
+        if accumulation_active:
+            pair_mode = "accumulation"
+        elif pair not in self._bid_enabled_pairs and inventory >= market.min_volume:
             pair_mode = "inventory-only"
 
         both_quoted = quote.bid_size > 0 and quote.ask_size > 0
@@ -475,10 +542,18 @@ class MomentumMarketMaker:
             "ws_age_sec":      orderbook.last_update_age_sec(),
             "quoting":         quote is not None and (quote.bid_size > 0 or quote.ask_size > 0),
             "halt_reason":     halt_reason,
+            "shock_regime":    self._shock_regime,
+            "shock_score_components": self._shock_detector.score_components() if self._shock_detector else {},
             "active_bid":      self._order_mgr.get_active(pair, "BID") is not None,
             "active_ask":      self._order_mgr.get_active(pair, "ASK") is not None,
             "updated_at":      time.time(),
         })
+
+    def _is_accumulation_pair(self, pair: str) -> bool:
+        configured = self._shock_cfg.get("accumulation_pairs", [])
+        if configured:
+            return pair in configured
+        return False
 
     # ── Periodic tasks ─────────────────────────────────────────────────────
 
@@ -490,6 +565,17 @@ class MomentumMarketMaker:
                 await self._signals.refresh()
                 self._update_bid_enabled_pairs()
                 self._last_signal_refresh = now
+
+            if self._shock_enabled and (now - self._last_shock_refresh) >= self._shock_refresh_interval:
+                try:
+                    await self._shock_detector.refresh()
+                    self._shock_regime = self._shock_detector.regime()
+                    self._last_shock_refresh = now
+                    components = dict(self._shock_detector.score_components())
+                    regime_component = components.pop("regime", self._shock_regime)
+                    log.info('"shock_regime_updated"', extra={"regime": regime_component, **components})
+                except Exception as exc:  # pragma: no cover - periodic safeguard
+                    log.warning('"shock detector refresh failed"', extra={"error": str(exc)})
 
             if now - self._last_state_save >= self._state_save_interval:
                 self._save_state()
@@ -523,7 +609,7 @@ class MomentumMarketMaker:
                 log.warning('"reconcile error"', extra={"pair": pair, "error": str(exc)})
 
     async def _refresh_market_info(self) -> None:
-        """Refresh market info for all active pairs — single bulk API call."""
+        """Refresh market info for all active pairs  Esingle bulk API call."""
         try:
             all_infos = await self._client.get_all_market_infos()
         except Exception as exc:
@@ -563,12 +649,16 @@ class MomentumMarketMaker:
         default_params: dict = uni_cfg.get("default_params", {})
         q_mult = Decimal(str(default_params.get("quote_size_multiplier", "1")))
         hc_mult = Decimal(str(default_params.get("hard_cap_multiplier", "200")))
+        # Layer 2: explicit trading allowlist for auto-discovered pairs.
+        # Non-empty → only pairs in this set receive WS/quotes/orders.
+        # Empty     → permissive (all active MYR pairs traded); not recommended.
+        bot_enabled: set[str] = set(uni_cfg.get("bot_enabled_pairs", []))
 
         # Single bulk API call
         try:
             all_markets = await self._client.get_all_market_infos()
         except Exception as exc:
-            log.error('"universe discovery failed — falling back to per-pair fetch"',
+            log.error('"universe discovery failed  Efalling back to per-pair fetch"',
                       extra={"error": str(exc)})
             await self._refresh_market_info()
             return
@@ -618,6 +708,19 @@ class MomentumMarketMaker:
 
             if market.status != "ACTIVE":
                 excluded[pair] = f"not_active:{market.status}"
+                continue
+
+            # Layer 2 gate: auto-discovered pair must be in bot_enabled_pairs.
+            # This separates exchange_discovered (Layer 1) from bot_enabled (Layer 2).
+            # Pairs that Luno adds in the future land here as watch-only until
+            # an operator explicitly adds them to the allowlist + pairs: config.
+            if bot_enabled and pair not in bot_enabled:
+                excluded[pair] = "watch_only"
+                self._watch_pairs[pair] = market
+                log.info(
+                    '"pair watch-only: not in bot_enabled_pairs"',
+                    extra={"pair": pair},
+                )
                 continue
 
             # Build injected default config
@@ -670,15 +773,40 @@ class MomentumMarketMaker:
         # Store for dashboard
         self._excluded_pairs = excluded
 
+        # Layer 3 validation: accumulation_pairs must be a subset of trading pairs.
+        # Warn at startup so misconfiguration is caught before a shock event occurs.
+        if self._shock_enabled:
+            accum_pairs = set(self._shock_cfg.get("accumulation_pairs", []))
+            not_in_trading = accum_pairs - set(self._pairs)
+            if not_in_trading:
+                log.warning(
+                    '"accumulation_pairs not in trading universe — check config"',
+                    extra={"invalid": sorted(not_in_trading)},
+                )
+        # Even when shock is disabled, warn if accumulation_pairs reference illiquid pairs.
+        # Operators should catch this before enabling the shock regime.
+        accum_pairs_cfg = set(self._shock_cfg.get("accumulation_pairs", []))
+        illiquid_accum = accum_pairs_cfg - {
+            p for p in accum_pairs_cfg
+            if p in self._market_info and self._market_info[p].status == "ACTIVE"
+        }
+        if illiquid_accum:
+            log.warning(
+                '"accumulation_pairs include inactive/unknown pairs"',
+                extra={"pairs": sorted(illiquid_accum)},
+            )
+
         # Summary log
         myr_total = len([p for p in all_markets if p.endswith("MYR")])
         log.info(
             '"universe discovery complete"',
             extra={
-                "myr_pairs_on_exchange": myr_total,
-                "added": sorted(added),
+                "layer1_exchange_discovered": myr_total,
+                "layer2_bot_trading": len(self._pairs),
+                "layer2_watch_only": len(self._watch_pairs),
+                "layer3_accumulation": len(self._shock_cfg.get("accumulation_pairs", [])),
+                "newly_added": sorted(added),
                 "excluded": sorted(excluded.keys()),
-                "total_active_pairs": len(self._pairs),
             },
         )
         for pair, reason in sorted(excluded.items()):
@@ -687,6 +815,9 @@ class MomentumMarketMaker:
                 extra={"pair": pair, "reason": reason},
             )
         _dashboard.update_universe(excluded)
+        _dashboard.update_accumulation_pairs(
+            self._shock_cfg.get("accumulation_pairs", [])
+        )
 
     async def _refresh_fees(self) -> None:
         for pair in self._pairs:
@@ -696,7 +827,7 @@ class MomentumMarketMaker:
                     "maker": fee.maker_fee,
                     "taker": fee.taker_fee,
                 }
-                # Warn if base spread is less than 2× maker fee
+                # Warn if base spread is less than 2ÁEmaker fee
                 pair_cfg = self._cfg["pairs"].get(pair, {})
                 spread_bps = float(pair_cfg.get("base_spread_bps", 0))
                 maker_bps = float(fee.maker_fee) * 10_000
@@ -713,7 +844,7 @@ class MomentumMarketMaker:
                 log.warning('"fee info error"', extra={"pair": pair, "error": str(exc)})
 
     async def _sync_balances(self) -> None:
-        """Sync inventory from REST balance (truth source). Runs in all modes — read-only."""
+        """Sync inventory from REST balance (truth source). Runs in all modes  Eread-only."""
         try:
             balances = await self._client.get_balances()
             self._myr_balance = balances.get("MYR", Decimal("0"))
@@ -730,11 +861,11 @@ class MomentumMarketMaker:
         new bids. Called after every signal refresh.
 
         Mode strings (stored in self._pair_modes, shown in dashboard/logs):
-          "bid-enabled"     — LONG, ranked within max_active_long_pairs cap
-          "rank-cutoff"     — LONG but exceeded cap; asks still allowed
-          "not-long"        — SHORT or NEUTRAL; asks still allowed
-          "below-min-size"  — configured quote_size_base < pair min_volume
-          "inactive"        — market info missing (failed validation)
+          "bid-enabled"      ELONG, ranked within max_active_long_pairs cap
+          "rank-cutoff"      ELONG but exceeded cap; asks still allowed
+          "not-long"         ESHORT or NEUTRAL; asks still allowed
+          "below-min-size"   Econfigured quote_size_base < pair min_volume
+          "inactive"         Emarket info missing (failed validation)
         """
         modes: dict[str, str] = {}
         ranks: dict[str, int] = {}
@@ -769,11 +900,26 @@ class MomentumMarketMaker:
 
         # Rank LONG candidates by score descending; assign bid-enabled up to cap
         long_candidates.sort(key=lambda x: x[0], reverse=True)
+        effective_max = self._max_long_pairs
+        if self._shock_enabled:
+            regime = self._shock_regime
+            if regime == "CAUTION":
+                effective_max = int(self._shock_cfg.get("caution_max_active_long_pairs", effective_max))
+            elif regime == "SHOCK":
+                effective_max = int(self._shock_cfg.get("shock_max_active_long_pairs", 1))
+            elif regime == "PANIC":
+                effective_max = int(self._shock_cfg.get("panic_max_active_long_pairs", 2))
+            elif regime == "RECOVERY":
+                effective_max = min(
+                    effective_max,
+                    int(self._shock_cfg.get("caution_max_active_long_pairs", effective_max)),
+                )
+
         new_bid_enabled: set[str] = set()
         for rank_idx, (score, pair) in enumerate(long_candidates):
             rank_1based = rank_idx + 1
             ranks[pair] = rank_1based
-            if rank_idx < self._max_long_pairs:
+            if rank_idx < max(1, effective_max):
                 new_bid_enabled.add(pair)
                 modes[pair] = "bid-enabled"
             else:
@@ -788,7 +934,7 @@ class MomentumMarketMaker:
             extra={
                 "bid_enabled": sorted(new_bid_enabled),
                 "long_ranked": [f"{p}({s:.1f})" for s, p in long_candidates],
-                "max_long_cap": self._max_long_pairs,
+                "max_long_cap": effective_max,
             },
         )
         _dashboard.update_universe(self._excluded_pairs)
@@ -827,7 +973,7 @@ class MomentumMarketMaker:
         without cancelling.
         """
         if self._dry_run:
-            log.info('"[DRY-RUN] startup order cleanup — would cancel all open orders"',
+            log.info('"[DRY-RUN] startup order cleanup  Ewould cancel all open orders"',
                      extra={"pairs": self._pairs})
             return
         total = 0
@@ -921,7 +1067,7 @@ def _simulate_fills_dryrun(
 
 
 def _base_asset(luno_pair: str) -> str:
-    """Extract base asset from Luno pair code, e.g. XBTMYR → XBT."""
+    """Extract base asset from Luno pair code, e.g. XBTMYR ↁEXBT."""
     # Known suffixes
     for suffix in ("MYR", "USDC", "USDT", "EUR", "GBP", "IDR", "NGN", "ZAR"):
         if luno_pair.endswith(suffix):
@@ -952,7 +1098,7 @@ def _parse_args() -> argparse.Namespace:
     mode.add_argument(
         "--no-auth",
         action="store_true",
-        help="Start the dashboard only — no credentials required, no exchange connections, stub data",
+        help="Start the dashboard only  Eno credentials required, no exchange connections, stub data",
     )
     parser.add_argument(
         "--confirm-live",
@@ -983,7 +1129,7 @@ def _parse_args() -> argparse.Namespace:
 
 async def _async_main_no_auth(args: argparse.Namespace) -> None:
     """
-    Offline dashboard mode — no credentials, no exchange connections.
+    Offline dashboard mode  Eno credentials, no exchange connections.
     Serves the dashboard with clearly labeled stub data.
     """
     config = load_config(args.config)
@@ -1026,7 +1172,7 @@ async def _async_main(args: argparse.Namespace) -> None:
         try:
             loop.add_signal_handler(sig, _sig_handler)
         except NotImplementedError:
-            # Windows — fall back to KeyboardInterrupt
+            # Windows  Efall back to KeyboardInterrupt
             pass
 
     await bot.run()
@@ -1074,3 +1220,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

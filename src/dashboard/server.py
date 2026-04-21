@@ -45,12 +45,18 @@ def update_pair(pair: str, data: dict) -> None:
     _bot_state["pairs"][pair] = data
 
 
-_universe_excluded: dict[str, str] = {}   # pair → exclusion reason
+_universe_excluded: dict[str, str] = {}   # pair → exclusion reason  (includes watch_only)
+_accumulation_pairs: list[str] = []       # Layer 3: shock-regime accumulation pairs
 
 
 def update_universe(excluded: dict[str, str]) -> None:
     global _universe_excluded
     _universe_excluded = dict(excluded)
+
+
+def update_accumulation_pairs(pairs: list[str]) -> None:
+    global _accumulation_pairs
+    _accumulation_pairs = list(pairs)
 
 
 # ── Stub data for --no-auth mode ──────────────────────────────────────────────
@@ -149,16 +155,42 @@ async def _handle_state(_request: web.Request) -> web.Response:
 
 
 async def _handle_universe(_request: web.Request) -> web.Response:
-    """Return full universe status: active pairs + excluded pairs with reasons."""
-    active = [
-        {"pair": p, "mode": d.get("pair_mode", "unknown"), "signal": d.get("signal", "NEUTRAL")}
+    """Return three-layer universe status.
+
+    Layer 1 (exchange_discovered): active + watch_only + excluded = all MYR pairs seen.
+    Layer 2 (bot_trading):         active pairs with WS/quotes/orders.
+    Layer 3 (accumulation):        subset of Layer 2 allowed in SHOCK/PANIC.
+    """
+    # Layer 2: trading-enabled pairs currently being quoted
+    trading = [
+        {
+            "pair": p,
+            "tier": "accumulation" if p in _accumulation_pairs else "standard",
+            "mode": d.get("pair_mode", "unknown"),
+            "signal": d.get("signal", "NEUTRAL"),
+        }
         for p, d in _bot_state["pairs"].items()
     ]
-    excluded = [
-        {"pair": p, "reason": r}
+    # Layer 1 only (not in trading set): watch-only and other exclusions
+    watch = [
+        {"pair": p, "tier": "watch_only", "reason": r}
         for p, r in sorted(_universe_excluded.items())
+        if r == "watch_only"
     ]
-    return web.json_response({"active": active, "excluded": excluded})
+    other_excluded = [
+        {"pair": p, "tier": "excluded", "reason": r}
+        for p, r in sorted(_universe_excluded.items())
+        if r != "watch_only"
+    ]
+    return web.json_response({
+        "layer2_trading": trading,
+        "layer1_watch_only": watch,
+        "excluded": other_excluded,
+        "layer3_accumulation": _accumulation_pairs,
+        # Backward-compat keys
+        "active": trading,
+        "excluded_all": watch + other_excluded,
+    })
 
 
 # ── Server lifecycle ──────────────────────────────────────────────────────────

@@ -125,6 +125,10 @@ class QuotingEngine:
         inventory: Decimal,           # current base position (≥ 0 in spot)
         config: PairQuoteConfig,
         market: MarketInfo,
+        *,
+        force_bid: bool = False,
+        target_inventory_ratio_override: Optional[float] = None,
+        spread_multiplier: float = 1.0,
     ) -> Optional[Quote]:
         """
         Compute target quotes. Returns None if quoting should be skipped
@@ -154,7 +158,11 @@ class QuotingEngine:
 
         # ── Inventory ratio ───────────────────────────────────────────────
 
-        target_inv = self._target_inventory(signal.direction, config)
+        target_inv = self._target_inventory(
+            signal.direction,
+            config,
+            target_inventory_ratio_override,
+        )
         inv_deviation = inventory - target_inv
         if config.max_inventory_base > 0:
             inv_ratio = float(inv_deviation / config.max_inventory_base)
@@ -165,6 +173,8 @@ class QuotingEngine:
         # ── Spread half ───────────────────────────────────────────────────
 
         half_bps = config.base_spread_bps / 2
+        if spread_multiplier != 1.0:
+            half_bps *= max(0.0, spread_multiplier)
 
         # Volatility widening
         if config.volatility_widening and book_spread_bps > config.vol_widening_threshold_bps:
@@ -221,7 +231,7 @@ class QuotingEngine:
 
         # Only accumulate new inventory when signal is explicitly LONG.
         # NEUTRAL and SHORT: no bids; manage existing inventory via asks only.
-        if signal.direction != "LONG":
+        if signal.direction != "LONG" and not force_bid:
             bid_size = Decimal("0")
         # If we have no inventory to sell, suppress ask
         if inventory < market.min_volume:
@@ -262,10 +272,16 @@ class QuotingEngine:
     # ── Helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
-    def _target_inventory(direction: str, cfg: PairQuoteConfig) -> Decimal:
+    def _target_inventory(
+        direction: str,
+        cfg: PairQuoteConfig,
+        override_ratio: Optional[float] = None,
+    ) -> Decimal:
         # Only hold inventory when LONG. NEUTRAL and SHORT both target 0
         # so the inventory skew pushes ask prices down to exit the position.
-        if direction == "LONG":
+        if override_ratio is not None:
+            ratio = override_ratio
+        elif direction == "LONG":
             ratio = cfg.target_inventory_long_ratio
         else:
             ratio = cfg.target_inventory_short_ratio   # should be 0.0

@@ -55,8 +55,25 @@ signal:
 # under  keep their explicit config; new pairs get defaults.
 universe:
   auto_discover: true
+
+  # ── Layer 2: bot trading allowlist ────────────────────────────────────────
+  # When non-empty, ONLY pairs listed here receive full trading access
+  # (WebSocket feed, quotes, order placement, risk registration).
+  # Any MYR pair that Luno adds in the future will be watch-only until an
+  # operator explicitly adds it here AND creates a full entry in pairs: below.
+  # Empty list = permissive (all active pairs can trade) — not recommended.
+  bot_enabled_pairs:
+    - XBTMYR    # Core liquid pairs — fully configured above
+    - ETHMYR
+    - XRPMYR
+    - SOLMYR
+    - TRXMYR
+    - SKYMYR
+    - LTCMYR
+    - PAXGMYR
+
   # Pairs permanently excluded from the universe regardless of signal.
-  exclude_pairs: []  # No permanent exclusions — all ACTIVE pairs are candidates
+  exclude_pairs: []  # No permanent exclusions needed when allowlist is active
   # Conservative defaults injected for every auto-discovered pair.
   # quote_size_base  = min_volume x quote_size_multiplier  (>= exchange minimum)
   # hard_cap_units   = min_volume x hard_cap_multiplier
@@ -80,6 +97,25 @@ universe:
     vol_widening_threshold_bps: 80.0
     max_vol_widening_factor: 3.0
     order_cooldown_sec: 3.0
+
+# ── Shock regime / accumulation ─────────────────────────────
+# Layer 3: accumulation_pairs is a strict subset of bot_enabled_pairs.
+# These pairs are allowed aggressive inventory accumulation during SHOCK or PANIC.
+# Must be restricted to the most liquid, core pairs only.
+# The bot validates at startup that every entry here is also trading-enabled.
+shock_regime:
+  enabled: false             # Disabled by default; enable only after full testing
+  accumulation_pairs:
+    - XBTMYR                 # Core liquid only — do not add illiquid pairs here
+    - ETHMYR
+  # Inventory targets during accumulation
+  accumulation_target_inventory_ratio: 0.80   # SHOCK: hold up to 80% of max
+  accumulation_panic_inventory_ratio: 0.95    # PANIC: hold up to 95% of max
+  accumulation_spread_multiplier: 1.5         # Widen spread during accumulation
+  caution_spread_multiplier: 1.2              # Widen slightly in CAUTION
+  caution_max_active_long_pairs: 1            # Reduce active pairs in CAUTION
+  shock_max_active_long_pairs: 1              # Reduce further in SHOCK
+  shock_refresh_interval_sec: 900             # Re-check regime every 15 min
 
 # ── Global risk limits ───────────────────────────────────────
 risk:
