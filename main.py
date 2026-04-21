@@ -65,9 +65,16 @@ def load_config(path: str) -> dict:
 
 
 def enabled_pairs(config: dict, filter_pairs: Optional[list[str]] = None) -> list[str]:
+    # bot_enabled_pairs is the single trading allowlist when non-empty.
+    # pairs[*].enabled: false is still respected as a secondary override.
+    # A pair must satisfy BOTH conditions to be traded.
+    bot_enabled: set[str] = set(
+        config.get("universe", {}).get("bot_enabled_pairs", [])
+    )
     pairs = [
         p for p, v in config.get("pairs", {}).items()
         if v.get("enabled", False)
+        and (not bot_enabled or p in bot_enabled)
     ]
     if filter_pairs:
         pairs = [p for p in pairs if p in filter_pairs]
@@ -167,6 +174,9 @@ class MomentumMarketMaker:
         self._pair_ranks: dict[str, int] = {}
         # Pairs excluded from universe with reasons (for dashboard/logs)
         self._excluded_pairs: dict[str, str] = {}
+        # Layer 1: exchange-discovered pairs not in bot_enabled_pairs.
+        # Tracked for observability, never traded.
+        self._watch_pairs: dict[str, MarketInfo] = {}
 
         # ── Timing ────────────────────────────────────────────────────────
 
@@ -563,6 +573,8 @@ class MomentumMarketMaker:
         default_params: dict = uni_cfg.get("default_params", {})
         q_mult = Decimal(str(default_params.get("quote_size_multiplier", "1")))
         hc_mult = Decimal(str(default_params.get("hard_cap_multiplier", "200")))
+        # Layer 2 allowlist — same set used by enabled_pairs() at startup.
+        bot_enabled: set[str] = set(uni_cfg.get("bot_enabled_pairs", []))
 
         # Single bulk API call
         try:
@@ -620,6 +632,14 @@ class MomentumMarketMaker:
                 excluded[pair] = f"not_active:{market.status}"
                 continue
 
+            # Layer 2 gate: auto-discovered pair must be in bot_enabled_pairs.
+            # Pairs Luno adds in future land here as watch-only until an operator
+            # explicitly adds them to bot_enabled_pairs AND creates a pairs: entry.
+            if bot_enabled and pair not in bot_enabled:
+                excluded[pair] = "watch_only"
+                self._watch_pairs[pair] = market
+                continue
+
             # Build injected default config
             quote_size = market.min_volume * q_mult
             hard_cap = market.min_volume * hc_mult
@@ -670,15 +690,37 @@ class MomentumMarketMaker:
         # Store for dashboard
         self._excluded_pairs = excluded
 
+        # Layer 3 validation: accumulation_pairs must be a subset of trading pairs.
+        # Warn at startup so misconfiguration is caught before a shock event occurs.
+        shock_cfg = self._cfg.get("shock_regime", {})
+        accum_pairs_cfg: set[str] = set(shock_cfg.get("accumulation_pairs", []))
+        not_in_trading = accum_pairs_cfg - set(self._pairs)
+        if not_in_trading:
+            log.warning(
+                '"accumulation_pairs not in trading universe — check config"',
+                extra={"invalid": sorted(not_in_trading)},
+            )
+        not_active = accum_pairs_cfg - {
+            p for p in accum_pairs_cfg
+            if p in self._market_info and self._market_info[p].status == "ACTIVE"
+        }
+        if not_active:
+            log.warning(
+                '"accumulation_pairs include inactive/unknown market — check config"',
+                extra={"pairs": sorted(not_active)},
+            )
+
         # Summary log
         myr_total = len([p for p in all_markets if p.endswith("MYR")])
         log.info(
             '"universe discovery complete"',
             extra={
-                "myr_pairs_on_exchange": myr_total,
-                "added": sorted(added),
+                "layer1_exchange_discovered": myr_total,
+                "layer2_bot_trading": len(self._pairs),
+                "layer2_watch_only": len(self._watch_pairs),
+                "layer3_accumulation": len(accum_pairs_cfg),
+                "newly_added": sorted(added),
                 "excluded": sorted(excluded.keys()),
-                "total_active_pairs": len(self._pairs),
             },
         )
         for pair, reason in sorted(excluded.items()):
@@ -687,6 +729,9 @@ class MomentumMarketMaker:
                 extra={"pair": pair, "reason": reason},
             )
         _dashboard.update_universe(excluded)
+        _dashboard.update_accumulation_pairs(
+            self._cfg.get("shock_regime", {}).get("accumulation_pairs", [])
+        )
 
     async def _refresh_fees(self) -> None:
         for pair in self._pairs:

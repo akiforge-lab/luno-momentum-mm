@@ -55,8 +55,24 @@ signal:
 # under  keep their explicit config; new pairs get defaults.
 universe:
   auto_discover: true
+
+  # ── Layer 2: bot trading allowlist ────────────────────────────────────────
+  # When non-empty, ONLY pairs listed here receive full trading access
+  # (WebSocket feed, quotes, order placement, risk registration).
+  # Any MYR pair Luno adds in the future is watch-only until added here.
+  # Empty list = permissive (all discovered active pairs trade) — not recommended.
+  bot_enabled_pairs:
+    - XBTMYR
+    - ETHMYR
+    - XRPMYR
+    - SOLMYR
+    - TRXMYR
+    - SKYMYR
+    - LTCMYR
+    - PAXGMYR
+
   # Pairs permanently excluded from the universe regardless of signal.
-  exclude_pairs: []  # No permanent exclusions — all ACTIVE pairs are candidates
+  exclude_pairs: []  # No permanent exclusions needed when allowlist is active
   # Conservative defaults injected for every auto-discovered pair.
   # quote_size_base  = min_volume x quote_size_multiplier  (>= exchange minimum)
   # hard_cap_units   = min_volume x hard_cap_multiplier
@@ -80,6 +96,16 @@ universe:
     vol_widening_threshold_bps: 80.0
     max_vol_widening_factor: 3.0
     order_cooldown_sec: 2.0
+
+# ── Shock regime / accumulation ─────────────────────────────
+# Layer 3: accumulation_pairs is a strict subset of bot_enabled_pairs.
+# Restricted to the most liquid core pairs. Validated at startup.
+# shock_regime.enabled is false by default — no behavioral change until enabled.
+shock_regime:
+  enabled: false
+  accumulation_pairs:
+    - XBTMYR
+    - ETHMYR
 
 # ── Global risk limits ───────────────────────────────────────
 risk:
