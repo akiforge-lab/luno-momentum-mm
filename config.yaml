@@ -290,3 +290,13 @@ pairs:
     vol_widening_threshold_bps: 80.0
     max_vol_widening_factor: 3.0
     order_cooldown_sec: 3.0
+
+# ── Shock-regime / accumulation ──────────────────────────────────────────────
+# When enabled: during extreme market stress, the bot switches designated pairs
+# to accumulation mode (bid-only, no asks). Disabled by default.
+# accumulation_pairs are validated at startup — all must be in the trading set.
+shock_regime:
+  enabled: false
+  accumulation_pairs:
+    - XBTMYR
+    - ETHMYR

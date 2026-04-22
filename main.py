@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -167,6 +168,8 @@ class MomentumMarketMaker:
         self._pair_ranks: dict[str, int] = {}
         # Pairs excluded from universe with reasons (for dashboard/logs)
         self._excluded_pairs: dict[str, str] = {}
+        # Pairs watch-only: auto-discovered but insufficient candle history
+        self._watch_pairs: dict[str, MarketInfo] = {}
 
         # ── Timing ────────────────────────────────────────────────────────
 
@@ -545,6 +548,69 @@ class MomentumMarketMaker:
                 },
             )
 
+    async def _fetch_and_count_candles(self, pair: str) -> int:
+        """
+        Return the number of valid daily closes available for *pair*.
+
+        Checks the SignalAdapter candle cache first; only calls the Luno API
+        if the cache is absent or stale.  Writes fetched candles to cache in
+        the same format used by SignalAdapter so the two never double-fetch on
+        the same startup.
+        """
+        sig_cfg = self._cfg.get("signal", {})
+        cache_dir = sig_cfg.get("cache_dir", "data/candles")
+        cache_ttl = float(sig_cfg.get("candle_cache_ttl_hours", 12)) * 3600
+
+        cache_path = Path(cache_dir) / f"{pair}.json"
+        now = time.time()
+
+        # Serve from cache if fresh enough
+        if cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                if now - cached.get("updated_at", 0) < cache_ttl:
+                    return len(cached.get("closes", []))
+            except Exception:
+                pass  # corrupt cache — fall through to API fetch
+
+        # Fetch from Luno
+        lookback_days = int(sig_cfg.get("lookback_days", SignalAdapter.LOOKBACK_DAYS))
+        since_ms = int((now - lookback_days * 86400) * 1000)
+        try:
+            raw = await self._client.get_candles(pair, since_ms=since_ms, duration_sec=86400)
+        except Exception as exc:
+            log.warning(
+                '"candle fetch failed during discovery"',
+                extra={"pair": pair, "error": str(exc)},
+            )
+            return 0
+
+        if not raw:
+            return 0
+
+        raw_sorted = sorted(raw, key=lambda c: int(c["timestamp"]))
+        closes_with_ts = [
+            (int(c["timestamp"]), float(c["close"]))
+            for c in raw_sorted
+            if float(c["close"]) > 0
+        ]
+
+        # Write to cache (same format as SignalAdapter._save_cache)
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(".tmp")
+        payload = {"updated_at": now, "closes": closes_with_ts}
+        try:
+            tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp_path, cache_path)
+        except Exception as exc:
+            log.warning(
+                '"candle cache write failed"',
+                extra={"pair": pair, "error": str(exc)},
+            )
+
+        log.info('"candles fetched for discovery"', extra={"pair": pair, "n": len(closes_with_ts)})
+        return len(closes_with_ts)
+
     async def _discover_universe(self) -> None:
         """
         Single-call market discovery. Always:
@@ -563,6 +629,8 @@ class MomentumMarketMaker:
         default_params: dict = uni_cfg.get("default_params", {})
         q_mult = Decimal(str(default_params.get("quote_size_multiplier", "1")))
         hc_mult = Decimal(str(default_params.get("hard_cap_multiplier", "200")))
+        sig_cfg = self._cfg.get("signal", {})
+        min_closes = int(sig_cfg.get("min_closes", SignalAdapter.MIN_CLOSES))
 
         # Single bulk API call
         try:
@@ -620,6 +688,20 @@ class MomentumMarketMaker:
                 excluded[pair] = f"not_active:{market.status}"
                 continue
 
+            # History gate: only promote if momentum can be computed.
+            # A pair with fewer than min_closes daily closes stays watch-only
+            # until it accumulates enough history. Promotion happens automatically
+            # on the next bot restart once the threshold is crossed.
+            n_closes = await self._fetch_and_count_candles(pair)
+            if n_closes < min_closes:
+                excluded[pair] = "watch_only"
+                self._watch_pairs[pair] = market
+                log.info(
+                    '"pair watch-only: insufficient candle history"',
+                    extra={"pair": pair, "n_closes": n_closes, "required": min_closes},
+                )
+                continue
+
             # Build injected default config
             quote_size = market.min_volume * q_mult
             hard_cap = market.min_volume * hc_mult
@@ -670,15 +752,30 @@ class MomentumMarketMaker:
         # Store for dashboard
         self._excluded_pairs = excluded
 
+        # Layer 3: validate accumulation pairs — all must be in the trading set.
+        shock_cfg = self._cfg.get("shock_regime", {})
+        accum_pairs: list[str] = shock_cfg.get("accumulation_pairs", [])
+        if accum_pairs:
+            trading_set = set(self._pairs)
+            missing = [p for p in accum_pairs if p not in trading_set]
+            if missing:
+                log.warning(
+                    '"accumulation pairs not in trading set — shock-regime would be unsafe"',
+                    extra={"missing": missing},
+                )
+
         # Summary log
         myr_total = len([p for p in all_markets if p.endswith("MYR")])
+        watch_only_pairs = sorted(p for p, r in excluded.items() if r == "watch_only")
         log.info(
             '"universe discovery complete"',
             extra={
-                "myr_pairs_on_exchange": myr_total,
-                "added": sorted(added),
-                "excluded": sorted(excluded.keys()),
-                "total_active_pairs": len(self._pairs),
+                "layer1_exchange_discovered": myr_total,
+                "layer2_trading": len(self._pairs),
+                "layer2_watch_only": len(watch_only_pairs),
+                "layer3_accumulation": accum_pairs,
+                "newly_added": sorted(added),
+                "excluded_other": sorted(p for p, r in excluded.items() if r != "watch_only"),
             },
         )
         for pair, reason in sorted(excluded.items()):
@@ -686,7 +783,10 @@ class MomentumMarketMaker:
                 '"pair excluded from universe"',
                 extra={"pair": pair, "reason": reason},
             )
+
+        # Update dashboard with excluded pairs and accumulation config
         _dashboard.update_universe(excluded)
+        _dashboard.update_accumulation_pairs(accum_pairs)
 
     async def _refresh_fees(self) -> None:
         for pair in self._pairs:
